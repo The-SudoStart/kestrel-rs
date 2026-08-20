@@ -36,7 +36,8 @@ use winit::raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 use winit::window::Window;
 
 use servo::{
-    RenderingContext, Servo, ServoBuilder, WebView, WebViewBuilder, WindowRenderingContext,
+    Preferences, RenderingContext, Servo, ServoBuilder, WebView, WebViewBuilder,
+    WindowRenderingContext,
 };
 use url::Url;
 
@@ -171,14 +172,18 @@ impl winit::application::ApplicationHandler<ServoWakeEvent> for Runner {
             WindowRenderingContext::new(display_handle, window_handle, physical_size)
                 .expect("Could not create WindowRenderingContext"),
         );
-        let _ = rendering_context.make_current();
+        let _ = rendering_context.make_current();            // Use WebPKI roots instead of platform verifier to avoid
+            // CaUsedAsEndEntity errors on some systems.
+            let prefs = Preferences {
+                network_use_webpki_roots: true,
+                ..Preferences::default()
+            };
 
-        let servo = ServoBuilder::default()
-            .event_loop_waker(Box::new(ServoWaker(event_loop_proxy.clone())))
-            .build();
-        servo.setup_logging();
-
-        let url = Url::parse("https://servo.org").expect("valid URL");
+            let servo = ServoBuilder::default()
+                .event_loop_waker(Box::new(ServoWaker(event_loop_proxy.clone())))
+                .preferences(prefs)
+                .build();
+        servo.setup_logging();            let url = Url::parse("https://example.com").expect("valid URL");
         let webview = WebViewBuilder::new(&servo, rendering_context.clone())
             .url(url)                .hidpi_scale_factor(euclid::Scale::new(window.scale_factor() as f32))
                 .delegate(Rc::new(WebViewDelegate))
@@ -273,8 +278,7 @@ impl winit::application::ApplicationHandler<ServoWakeEvent> for Runner {
             modifiers: ModifiersState::default(),
             cache: user_interface::Cache::new(),
             events: Vec::new(),
-            resized: false,
-            url_value: "https://servo.org".to_string(),
+            resized: false,                url_value: "https://example.com".to_string(),
             servo,
             webview,
             rendering_context,
