@@ -26,6 +26,13 @@ euclid = "0.22"
 
 # TLS provider (required by Servo's networking stack)
 rustls = { version = "0.23", features = ["aws-lc-rs"] }
+iced_winit = "0.14.0"
+iced_wgpu = { version = "0.14.0", features = ["image"] }
+iced_widget = { version = "0.14.0", features = ["image"] }
+iced_runtime = "0.14.0"
+glow = "0.17.0"
+iced_graphics = "0.14.0"
+pollster = "1.0.1"
 
 [profile.dev]
 # Servo/Iced debug builds are slow to compile — opt-level 1 for deps

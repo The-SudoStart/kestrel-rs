@@ -21,6 +21,8 @@ use winit::keyboard::{Key, NamedKey};
 use winit::raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 use winit::window::Window;
 
+mod ui;
+
 use servo::{
     RenderingContext, Servo, ServoBuilder, WebView, WebViewBuilder, WindowRenderingContext,
 };
@@ -77,6 +79,7 @@ enum Runner {
         webview: WebView,
         rendering_context: Rc<WindowRenderingContext>,
         url_value: String,
+        iced_integration: ui::IcedIntegration,
     },
 }
 
@@ -130,12 +133,16 @@ impl winit::application::ApplicationHandler<ServoWakeEvent> for Runner {
         event_loop.set_control_flow(ControlFlow::Wait);
         window.set_title(&format!("kestrel-rs — {initial_url}"));
 
+        let mut iced_integration = pollster::block_on(ui::IcedIntegration::new(window.clone()));
+        iced_integration.state.url_value = initial_url.to_string();
+
         *self = Self::Ready {
             window,
             servo,
             webview,
             rendering_context,
             url_value: initial_url.to_string(),
+            iced_integration,
         };
     }
 
@@ -161,6 +168,7 @@ impl winit::application::ApplicationHandler<ServoWakeEvent> for Runner {
             webview,
             rendering_context,
             url_value,
+            iced_integration,
         } = self
         else {
             return;
@@ -172,11 +180,51 @@ impl winit::application::ApplicationHandler<ServoWakeEvent> for Runner {
         match &event {
             WindowEvent::RedrawRequested => {
                 webview.paint();
-                rendering_context.present();
+                
+                // Read pixels from Servo's GL framebuffer
+                let physical_size = window.inner_size();
+                let width = physical_size.width;
+                let height = physical_size.height;
+                
+                if width > 0 && height > 0 {
+                    let gl = rendering_context.glow_gl_api();
+                    let mut pixels = vec![0u8; (width * height * 4) as usize];
+                    unsafe {
+                        use glow::HasContext;
+                        gl.read_pixels(
+                            0,
+                            0,
+                            width as i32,
+                            height as i32,
+                            glow::RGBA,
+                            glow::UNSIGNED_BYTE,
+                            glow::PixelPackData::Slice(Some(&mut pixels)),
+                        );
+                    }
+                    
+                    // OpenGL reads pixels bottom-up, we need to flip them vertically
+                    let row_bytes = (width * 4) as usize;
+                    for i in 0..(height as usize / 2) {
+                        let top_idx = i * row_bytes;
+                        let bot_idx = (height as usize - 1 - i) * row_bytes;
+                        for j in 0..row_bytes {
+                            pixels.swap(top_idx + j, bot_idx + j);
+                        }
+                    }
+                    
+                    // Update the image in the iced UI state
+                    let handle = iced_widget::image::Handle::from_rgba(width, height, pixels);
+                    iced_integration.state.servo_pixels = Some(handle);
+                }
+                
+                // Present using Iced (wgpu)
+                iced_integration.render(window);
             }
 
             WindowEvent::Resized(new_size) => {
+                webview.resize(*new_size);
                 rendering_context.resize(*new_size);
+                iced_integration.resize(new_size.width, new_size.height);
             }
 
             // ---- Keyboard input: raw capture for URL bar ----
@@ -206,18 +254,26 @@ impl winit::application::ApplicationHandler<ServoWakeEvent> for Runner {
                             }
                         }
                         window.set_title(&format!("kestrel-rs — {url_value}"));
+                        iced_integration.state.url_value = url_value.clone();
+                        window.request_redraw();
                     }
                     Key::Named(NamedKey::Backspace) => {
                         url_value.pop();
                         window.set_title(&format!("kestrel-rs — {url_value}"));
+                        iced_integration.state.url_value = url_value.clone();
+                        window.request_redraw();
                     }
                     Key::Named(NamedKey::Escape) => {
                         url_value.clear();
                         window.set_title("kestrel-rs");
+                        iced_integration.state.url_value = url_value.clone();
+                        window.request_redraw();
                     }
                     Key::Character(c) => {
                         url_value.push_str(c.as_str());
                         window.set_title(&format!("kestrel-rs — {url_value}"));
+                        iced_integration.state.url_value = url_value.clone();
+                        window.request_redraw();
                     }
                     _ => {}
                 }
