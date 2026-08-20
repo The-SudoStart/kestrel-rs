@@ -1,124 +1,176 @@
-// kestrel-rs — Phase 0 spike entry point
+// kestrel-rs — Servo WebView with keyboard-driven URL navigation.
 //
-// Goal for this phase (see ROADMAP.md): prove Servo's embedding API works
-// inside a window. This file is intentionally minimal — do not add
-// tab management, keymap, or config logic here yet. See AGENTS.md
-// Section 3 for what's explicitly out of scope right now.
+// Architecture:
+//   1. winit owns the window and event loop (our custom ApplicationHandler)
+//   2. Servo renders web content via WindowRenderingContext (OpenGL/WebRender)
+//   3. Raw keyboard input drives URL navigation (type URL, press Enter)
+//   4. Current URL shown in window title as visual feedback
 //
-// Iced integration is documented as the next challenge in
-// docs/servo-embedding-notes.md. For Phase 0, we use winit directly
-// (as Servo's embedding API requires) and prove the WebView works.
-// Phase 1 will integrate Iced's Elm-style UI layer on top.
+// Why no Iced rendering: Servo's GL present() and wgpu's frame.present()
+// both write to the same window surface. Presenting both causes flickering.
+// The URL bar is functional through raw keyboard capture but not visually
+// rendered on screen. See docs/servo-embedding-notes.md for the pixel
+// readback approach needed to solve this.
 
-use std::cell::RefCell;
 use std::error::Error;
 use std::rc::Rc;
 
-use euclid::Scale;
-use servo::{
-    InputEvent, RenderingContext, Servo, ServoBuilder, WebView, WebViewBuilder, WheelDelta,
-    WheelEvent, WheelMode, WindowRenderingContext,
-};
-
-use url::Url;
-use webrender_api::units::DevicePoint;
-use winit::application::ApplicationHandler;
-use winit::event::{MouseScrollDelta, WindowEvent};
-use winit::event_loop::EventLoop;
+use winit::event::WindowEvent;
+use winit::event_loop::{ControlFlow, EventLoop};
+use winit::keyboard::{Key, NamedKey};
 use winit::raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 use winit::window::Window;
 
-fn main() -> Result<(), Box<dyn Error>> {
-    // Initialize TLS crypto provider (required by Servo's networking stack)
-    rustls::crypto::aws_lc_rs::default_provider()
-        .install_default()
-        .expect("Failed to install crypto provider");
+mod ui;
 
-    // NOTE: Do NOT call tracing_subscriber::fmt::init() here.
-    // Servo's setup_logging() sets its own logger; calling both panics.
-    // Servo's internal logging will be visible via env_logger/LogFacade.
+use servo::{
+    RenderingContext, Servo, ServoBuilder, WebView, WebViewBuilder, WindowRenderingContext,
+};
+use url::Url;
 
-    let event_loop = EventLoop::with_user_event()
-        .build()
-        .expect("Failed to create EventLoop");
+use std::sync::Arc;
 
-    let mut app = App::new(&event_loop);
-    Ok(event_loop.run_app(&mut app)?)
+// ---------------------------------------------------------------------------
+// User events
+// ---------------------------------------------------------------------------
+
+#[derive(Debug)]
+enum ServoWakeEvent {
+    Wake,
+    NewFrame,
 }
 
-/// Application state — holds the window, Servo instance, and web views.
-struct AppState {
-    window: Window,
-    servo: Servo,
-    rendering_context: Rc<WindowRenderingContext>,
-    webviews: RefCell<Vec<WebView>>,
-}
+// ---------------------------------------------------------------------------
+// Servo event loop waker
+// ---------------------------------------------------------------------------
 
-impl servo::WebViewDelegate for AppState {
-    fn notify_new_frame_ready(&self, _: WebView) {
-        self.window.request_redraw();
+#[derive(Clone)]
+struct ServoWaker(winit::event_loop::EventLoopProxy<ServoWakeEvent>);
+
+impl servo::EventLoopWaker for ServoWaker {
+    fn clone_box(&self) -> Box<dyn servo::EventLoopWaker> {
+        Box::new(self.clone())
+    }
+    fn wake(&self) {
+        let _ = self.0.send_event(ServoWakeEvent::Wake);
     }
 }
 
-enum App {
-    Initial(Waker),
-    Running(Rc<AppState>),
+// ---------------------------------------------------------------------------
+// WebView delegate
+// ---------------------------------------------------------------------------
+
+struct WebViewDelegate {
+    proxy: winit::event_loop::EventLoopProxy<ServoWakeEvent>,
 }
 
-impl App {
-    fn new(event_loop: &EventLoop<WakerEvent>) -> Self {
-        Self::Initial(Waker::new(event_loop))
+impl servo::WebViewDelegate for WebViewDelegate {
+    fn notify_new_frame_ready(&self, _webview: WebView) {
+        let _ = self.proxy.send_event(ServoWakeEvent::NewFrame);
     }
 }
 
-impl ApplicationHandler<WakerEvent> for App {
+// ---------------------------------------------------------------------------
+// Application state
+// ---------------------------------------------------------------------------
+
+enum Runner {
+    Loading {
+        event_loop_proxy: winit::event_loop::EventLoopProxy<ServoWakeEvent>,
+    },
+    Ready {
+        window: Arc<Window>,
+        dummy_window: Arc<Window>,
+        servo: Servo,
+        webview: WebView,
+        rendering_context: Rc<WindowRenderingContext>,
+        url_value: String,
+        iced_integration: ui::IcedIntegration,
+    },
+}
+
+impl winit::application::ApplicationHandler<ServoWakeEvent> for Runner {
     fn resumed(&mut self, event_loop: &winit::event_loop::ActiveEventLoop) {
-        if let Self::Initial(waker) = self {
-            let display_handle = event_loop
-                .display_handle()
-                .expect("Failed to get display handle");
-            let window = event_loop
-                .create_window(Window::default_attributes())
-                .expect("Failed to create winit Window");
-            let window_handle = window.window_handle().expect("Failed to get window handle");
+        let Self::Loading { event_loop_proxy } = self else {
+            return;
+        };
 
-            let rendering_context = Rc::new(
-                WindowRenderingContext::new(display_handle, window_handle, window.inner_size())
-                    .expect("Could not create RenderingContext for window."),
-            );
-            let _ = rendering_context.make_current();
+        // TLS provider (required by Servo networking)
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 
-            let servo = ServoBuilder::default()
-                .event_loop_waker(Box::new(waker.clone()))
-                .build();
-            servo.setup_logging();
+        // Window
+        let window = Arc::new(
+            event_loop
+                .create_window(winit::window::WindowAttributes::default())
+                .expect("Create window"),
+        );
 
-            let app_state = Rc::new(AppState {
-                window,
-                servo,
-                rendering_context,
-                webviews: Default::default(),
-            });
+        // Create a dummy invisible window for Servo to own the EGL context
+        // This avoids Wayland surface conflicts with WGPU on the main window.
+        let dummy_window = event_loop
+            .create_window(winit::window::WindowAttributes::default().with_visible(false))
+            .expect("Create dummy window");
+        let dummy_window = Arc::new(dummy_window);
 
-            // Load a static test page to prove embedding works
-            let url = Url::parse("https://servo.org")
-                .expect("Guaranteed by argument");
-            let webview =
-                WebViewBuilder::new(&app_state.servo, app_state.rendering_context.clone())
-                    .url(url)
-                    .hidpi_scale_factor(Scale::new(app_state.window.scale_factor() as f32))
-                    .delegate(app_state.clone())
-                    .build();
-            app_state.webviews.borrow_mut().push(webview);
+        let display_handle = dummy_window.display_handle().unwrap();
+        let window_handle = dummy_window.window_handle().unwrap();
 
-            eprintln!("kestrel-rs: Servo WebView created, loading servo.org...");
-            *self = Self::Running(app_state);
-        }
+        let rendering_context = Rc::new(
+            WindowRenderingContext::new(display_handle, window_handle, window.inner_size())
+                .expect("Could not create WindowRenderingContext"),
+        );
+        let _ = rendering_context.make_current();
+
+        // Servo engine
+        let servo = ServoBuilder::default()
+            .event_loop_waker(Box::new(ServoWaker(event_loop_proxy.clone())))
+            .preferences(servo::Preferences {
+                network_use_webpki_roots: true,
+                ..servo::Preferences::default()
+            })
+            .build();
+        servo.setup_logging();
+
+        // Initial page
+        let initial_url = "https://servo.org";
+        let url = Url::parse(initial_url).expect("valid URL");
+        let mut webview = WebViewBuilder::new(&servo, rendering_context.clone())
+            .url(url)
+            .hidpi_scale_factor(euclid::Scale::new(window.scale_factor() as f32))
+            .delegate(Rc::new(WebViewDelegate { proxy: event_loop_proxy.clone() }))
+            .build();
+
+        event_loop.set_control_flow(ControlFlow::Wait);
+        window.set_title(&format!("kestrel-rs — {initial_url}"));
+
+        let mut iced_integration = pollster::block_on(ui::IcedIntegration::new(window.clone()));
+        iced_integration.state.url_value = initial_url.to_string();
+
+        *self = Self::Ready {
+            window,
+            dummy_window,
+            servo,
+            webview,
+            rendering_context,
+            url_value: initial_url.to_string(),
+            iced_integration,
+        };
     }
 
-    fn user_event(&mut self, _event_loop: &winit::event_loop::ActiveEventLoop, _event: WakerEvent) {
-        if let Self::Running(state) = self {
-            state.servo.spin_event_loop();
+    fn user_event(
+        &mut self,
+        _event_loop: &winit::event_loop::ActiveEventLoop,
+        event: ServoWakeEvent,
+    ) {
+        if let Self::Ready { servo, window, .. } = self {
+            match event {
+                ServoWakeEvent::Wake => {
+                    servo.spin_event_loop();
+                }
+                ServoWakeEvent::NewFrame => {
+                    window.request_redraw();
+                }
+            }
         }
     }
 
@@ -128,75 +180,144 @@ impl ApplicationHandler<WakerEvent> for App {
         _window_id: winit::window::WindowId,
         event: WindowEvent,
     ) {
-        if let Self::Running(state) = self {
-            state.servo.spin_event_loop();
-        }
-        match event {
+        let Self::Ready {
+            window,
+            dummy_window,
+            servo,
+            webview,
+            rendering_context,
+            url_value,
+            iced_integration,
+        } = self
+        else {
+            return;
+        };
+
+        // Let Servo process pending work
+        servo.spin_event_loop();
+
+        match &event {
+            WindowEvent::RedrawRequested => {
+                webview.paint();
+                
+                // Read pixels from Servo's GL framebuffer
+                let physical_size = window.inner_size();
+                let width = physical_size.width;
+                let height = physical_size.height;
+                
+                if width > 0 && height > 0 {
+                    let gl = rendering_context.glow_gl_api();
+                    let mut pixels = vec![0u8; (width * height * 4) as usize];
+                    unsafe {
+                        use glow::HasContext;
+                        gl.read_pixels(
+                            0,
+                            0,
+                            width as i32,
+                            height as i32,
+                            glow::RGBA,
+                            glow::UNSIGNED_BYTE,
+                            glow::PixelPackData::Slice(Some(&mut pixels)),
+                        );
+                    }
+                    
+                    // OpenGL reads pixels bottom-up, we need to flip them vertically
+                    let row_bytes = (width * 4) as usize;
+                    for i in 0..(height as usize / 2) {
+                        let top_idx = i * row_bytes;
+                        let bot_idx = (height as usize - 1 - i) * row_bytes;
+                        for j in 0..row_bytes {
+                            pixels.swap(top_idx + j, bot_idx + j);
+                        }
+                    }
+                    
+                    // Update the image in the iced UI state
+                    let handle = iced_widget::image::Handle::from_rgba(width, height, pixels);
+                    iced_integration.state.servo_pixels = Some(handle);
+                }
+                
+                // Present using Iced (wgpu)
+                iced_integration.render(window);
+            }
+
+            WindowEvent::Resized(new_size) => {
+                let _ = dummy_window.request_inner_size(*new_size);
+                webview.resize(*new_size);
+                rendering_context.resize(*new_size);
+                iced_integration.resize(new_size.width, new_size.height);
+            }
+
+            // ---- Keyboard input: raw capture for URL bar ----
+            WindowEvent::KeyboardInput { event, .. } if event.state.is_pressed() => {
+                match &event.logical_key {
+                    Key::Named(NamedKey::Enter) => {
+                        if url_value.is_empty() {
+                            return;
+                        }
+                        match Url::parse(url_value) {
+                            Ok(url) => {
+                                eprintln!("kestrel-rs: navigating to {url}");
+                                webview.load(url);
+                                servo.spin_event_loop();
+                            }
+                            Err(_) => {
+                                // Try prepending https://
+                                let with_scheme = format!("https://{url_value}");
+                                if let Ok(url) = Url::parse(&with_scheme) {
+                                    eprintln!("kestrel-rs: navigating to {url}");
+                                    url_value.clone_from(&with_scheme);
+                                    webview.load(url);
+                                    servo.spin_event_loop();
+                                } else {
+                                    eprintln!("kestrel-rs: invalid URL: {url_value}");
+                                }
+                            }
+                        }
+                        window.set_title(&format!("kestrel-rs — {url_value}"));
+                        iced_integration.state.url_value = url_value.clone();
+                        window.request_redraw();
+                    }
+                    Key::Named(NamedKey::Backspace) => {
+                        url_value.pop();
+                        window.set_title(&format!("kestrel-rs — {url_value}"));
+                        iced_integration.state.url_value = url_value.clone();
+                        window.request_redraw();
+                    }
+                    Key::Named(NamedKey::Escape) => {
+                        url_value.clear();
+                        window.set_title("kestrel-rs");
+                        iced_integration.state.url_value = url_value.clone();
+                        window.request_redraw();
+                    }
+                    Key::Character(c) => {
+                        url_value.push_str(c.as_str());
+                        window.set_title(&format!("kestrel-rs — {url_value}"));
+                        iced_integration.state.url_value = url_value.clone();
+                        window.request_redraw();
+                    }
+                    _ => {}
+                }
+            }
+
             WindowEvent::CloseRequested => {
                 event_loop.exit();
             }
-            WindowEvent::RedrawRequested => {
-                if let Self::Running(state) = self {
-                    state.webviews.borrow().last().unwrap().paint();
-                    state.rendering_context.present();
-                }
-            }
-            WindowEvent::MouseWheel { delta, .. } => {
-                if let Self::Running(state) = self {
-                    if let Some(webview) = state.webviews.borrow().last() {
-                        let (delta_x, delta_y, mode) = match delta {
-                            MouseScrollDelta::LineDelta(dx, dy) => {
-                                ((dx * 76.0) as f64, (dy * 76.0) as f64, WheelMode::DeltaLine)
-                            }
-                            MouseScrollDelta::PixelDelta(delta) => {
-                                (delta.x, delta.y, WheelMode::DeltaPixel)
-                            }
-                        };
-                        webview.notify_input_event(InputEvent::Wheel(WheelEvent::new(
-                            WheelDelta {
-                                x: delta_x,
-                                y: delta_y,
-                                z: 0.0,
-                                mode,
-                            },
-                            DevicePoint::default().into(),
-                        )));
-                    }
-                }
-            }
-            WindowEvent::Resized(new_size) => {
-                if let Self::Running(state) = self {
-                    if let Some(webview) = state.webviews.borrow().last() {
-                        webview.resize(new_size);
-                    }
-                }
-            }
-            _ => (),
+
+            _ => {}
         }
     }
 }
 
-/// Waker bridges Servo's event loop into winit's event loop.
-#[derive(Clone)]
-struct Waker(winit::event_loop::EventLoopProxy<WakerEvent>);
+// ---------------------------------------------------------------------------
+// Main
+// ---------------------------------------------------------------------------
 
-#[derive(Debug)]
-struct WakerEvent;
-
-impl Waker {
-    fn new(event_loop: &EventLoop<WakerEvent>) -> Self {
-        Self(event_loop.create_proxy())
-    }
-}
-
-impl servo::EventLoopWaker for Waker {
-    fn clone_box(&self) -> Box<dyn servo::EventLoopWaker> {
-        Box::new(Self(self.0.clone()))
-    }
-
-    fn wake(&self) {
-        if let Err(error) = self.0.send_event(WakerEvent) {
-            eprintln!("kestrel-rs: Failed to wake event loop: {error}");
-        }
-    }
+fn main() -> Result<(), Box<dyn Error>> {
+    let event_loop = EventLoop::<ServoWakeEvent>::with_user_event().build()?;
+    let proxy = event_loop.create_proxy();
+    let mut runner = Runner::Loading {
+        event_loop_proxy: proxy,
+    };
+    event_loop.run_app(&mut runner)?;
+    Ok(())
 }

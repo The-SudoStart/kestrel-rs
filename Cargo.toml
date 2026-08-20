@@ -7,8 +7,10 @@ license = "MIT"
 repository = "https://github.com/The-SudoStart/kestrel-rs"
 
 [dependencies]
-# GUI framework — see ARCHITECTURE.md for why Iced was chosen
-iced = "0.14"
+# NOTE: Iced crates (iced_winit, iced_wgpu, iced_widget, iced_runtime)
+# were removed because Servo's GL and wgpu's Vulkan cannot both present
+# to the same window surface. See docs/servo-embedding-notes.md for
+# the pixel readback approach needed to reintroduce Iced rendering.
 
 # Servo embedding — verified against crates.io (v0.5.0, released 2026-08-17).
 # See docs/servo-embedding-notes.md for API surface notes.
@@ -18,17 +20,19 @@ servo = { version = "0.5", default-features = true }
 # Both Servo (dev dep) and Iced (via iced_winit) use winit ^0.30.
 winit = "0.30"
 
-# Supporting crates used by Servo's embedding API
+# URL parsing and geometry types (needed by Servo's hidpi_scale_factor)
 url = "2"
-webrender_api = "0.70"
 euclid = "0.22"
-
-# Logging (Servo uses tracing internally)
-tracing = "0.1"
-tracing-subscriber = "0.3"
 
 # TLS provider (required by Servo's networking stack)
 rustls = { version = "0.23", features = ["aws-lc-rs"] }
+iced_winit = "0.14.0"
+iced_wgpu = { version = "0.14.0", features = ["image"] }
+iced_widget = { version = "0.14.0", features = ["image"] }
+iced_runtime = "0.14.0"
+glow = "0.17.0"
+iced_graphics = "0.14.0"
+pollster = "1.0.1"
 
 [profile.dev]
 # Servo/Iced debug builds are slow to compile — opt-level 1 for deps

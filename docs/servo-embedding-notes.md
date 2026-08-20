@@ -160,14 +160,85 @@ Potential Phase 1 issues:
    both try to set the global logger. Only one can be called. We let Servo handle
    logging and use `eprintln!` for our own output.
 
-2. **TLS certificate verification fails**: `rustls_platform_verifier` can't verify
-   HTTPS certificates in some environments (error: `CaUsedAsEndEntity`). The WebView
-   is created and runs, but can't fetch HTTPS pages. This is an environment issue,
-   not a code bug. For development, we could use `env_logger` with
-   `RUST_LOG=servo=debug` for more details.
+2. **TLS certificate verification fails** (FIXED): `rustls_platform_verifier` can't
+   verify HTTPS certificates on some systems (error: `CaUsedAsEndEntity`). **Fix:**
+   Set `Preferences { network_use_webpki_roots: true, ..Default::default() }` on
+   `ServoBuilder` to use bundled WebPKI root certificates instead of the platform
+   verifier. See [Servo config prefs](servo-config/prefs.rs).
 
 3. **SQLite storage warnings**: `ClientStorage` can't open its database in `/tmp`.
    Non-fatal — logged as warnings but doesn't affect functionality.
+
+## Iced <-> Servo integration pattern (Issue #1 findings)
+
+### Architecture that works
+
+The integration uses the **low-level Iced crate path** (not `iced::application()`):
+
+1. **winit** owns the window and event loop (our custom `ApplicationHandler`)
+2. **Servo** renders web content via `WindowRenderingContext` (OpenGL/WebRender)
+3. **wgpu** creates a rendering surface on the same window (Vulkan backend)
+4. **Iced's `UserInterface`** renders the URL bar via wgpu on top
+
+This is based on Iced's `integration` example but adapted for Servo coexistence.
+
+### Key API signatures (iced 0.14, wgpu 27)
+
+- `UserInterface::build(element, size, cache, renderer)` — builds UI
+- `UserInterface::update(&mut self, events, cursor, renderer, clipboard, messages)` — processes events
+- `Viewport::with_physical_size(size, scale_factor: f32)` — NOT a Scale struct, just f32
+- `Renderer::new(engine, default_font, default_text_size)` — takes Font and Pixels, not Settings
+- `wgpu::Surface::get_current_texture()` returns `Result<SurfaceTexture, SurfaceError>`
+- `iced_winit::conversion::window_event()` converts winit events to Iced events
+- `iced_winit::core::Clipboard` trait must be implemented (NullClipboard for now)
+
+### Servo <-> Iced communication pattern
+
+Navigation dispatch flow:
+1. User types in Iced text_input, presses Enter
+2. Iced `UserInterface::update()` produces `Message::UrlBarSubmitted`
+3. In our message handler: `webview.load(url)` — calls Servo's navigation API
+4. `servo.spin_event_loop()` — processes the navigation request
+5. Servo fetches the page via its networking stack
+6. `notify_new_frame_ready` callback triggers redraw
+7. `webview.paint()` + `rendering_context.present()` renders new content
+
+### What we learned
+
+1. **Servo's GL context and wgpu can coexist on the same Wayland window.**
+   Servo uses OpenGL (WebRender), wgpu uses Vulkan. The Wayland compositor handles both.
+2. **Servo must render FIRST, then Iced draws on top.**
+   Order: `webview.paint()` → `rendering_context.present()` → wgpu render pass → Iced draw → present.
+3. **The URL bar text_input works** — typing, backspace, and Enter all function correctly
+   through Iced's `UserInterface` event processing.
+4. **Navigation dispatch works** — calling `webview.load(url)` from the Iced message
+   handler successfully triggers Servo navigation.
+
+### Current state: raw keyboard navigation
+
+Iced crates were removed from Cargo.toml because Servo's GL and wgpu's Vulkan
+cannot both present to the same window surface (causes flickering). The URL bar
+is implemented as raw keyboard capture in the winit ApplicationHandler:
+
+- Character input builds the URL string
+- Backspace deletes, Escape clears
+- Enter navigates (auto-prepends `https://` if no scheme)
+- URL displayed in window title
+
+This proves the Servo navigation dispatch pattern works. The Iced widget
+rendering remains the key unsolved integration challenge.
+
+### Remaining gaps
+
+- **Visual Iced widget rendering on top of Servo**: The core architectural
+  challenge. Servo owns the GL context; Iced/wgpu wants its own Vulkan surface.
+  They cannot both present to the same window. **Path forward**: read pixels
+  from Servo's GL framebuffer (via `glReadPixels` on the `WindowRenderingContext`'s
+  glow context), upload as a wgpu texture, draw Iced UI on top, present only
+  via wgpu.
+- Clipboard is not implemented — no copy/paste support
+- No mouse forwarding to Servo yet — keyboard events work but mouse clicks don't
+  reach the WebView (need to forward winit mouse events to `webview.notify_input_event()`)
 
 ## System dependencies discovered
 
