@@ -8,18 +8,32 @@ repository = "https://github.com/The-SudoStart/kestrel-rs"
 
 [dependencies]
 # GUI framework — see ARCHITECTURE.md for why Iced was chosen
-iced = "0.13"
+iced = "0.14"
 
-# Servo embedding — VERIFY exact crate name/version against current
-# crates.io listing before Phase 0 work starts. Servo's embedding API is
-# young (0.1.x as of mid-2026) and crate naming may shift. Do not assume
-# this line is correct without checking servo.org / crates.io first.
-# servo = "0.1"
+# Servo embedding — verified against crates.io (v0.5.0, released 2026-08-17).
+# See docs/servo-embedding-notes.md for API surface notes.
+servo = { version = "0.5", default-features = true }
+
+# Servo embedding requires winit for the event loop and window management.
+# Both Servo (dev dep) and Iced (via iced_winit) use winit ^0.30.
+winit = "0.30"
+
+# Supporting crates used by Servo's embedding API
+url = "2"
+webrender_api = "0.70"
+euclid = "0.22"
+
+# Logging (Servo uses tracing internally)
+tracing = "0.1"
+tracing-subscriber = "0.3"
+
+# TLS provider (required by Servo's networking stack)
+rustls = { version = "0.23", features = ["aws-lc-rs"] }
 
 [profile.dev]
-# Servo/Iced debug builds can be slow to compile repeatedly — opt-level 1
-# for dependencies speeds up iteration without sacrificing much.
-opt-level = 0
+# Servo/Iced debug builds are slow to compile — opt-level 1 for deps
+# speeds up iteration without sacrificing much debuggability.
+opt-level = 1
 
 [profile.release]
 opt-level = 3
