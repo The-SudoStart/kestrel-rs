@@ -214,15 +214,29 @@ Navigation dispatch flow:
 4. **Navigation dispatch works** — calling `webview.load(url)` from the Iced message
    handler successfully triggers Servo navigation.
 
+### Current state: raw keyboard navigation
+
+Iced crates were removed from Cargo.toml because Servo's GL and wgpu's Vulkan
+cannot both present to the same window surface (causes flickering). The URL bar
+is implemented as raw keyboard capture in the winit ApplicationHandler:
+
+- Character input builds the URL string
+- Backspace deletes, Escape clears
+- Enter navigates (auto-prepends `https://` if no scheme)
+- URL displayed in window title
+
+This proves the Servo navigation dispatch pattern works. The Iced widget
+rendering remains the key unsolved integration challenge.
+
 ### Remaining gaps
 
-- **Visual URL bar rendering**: Servo's GL `present()` and wgpu's `frame.present()`
-  both write to the same window surface, causing flickering. We now only present
-  via Servo's GL. The URL bar is functional through event processing but not
-  visually rendered. **Path forward**: read pixels from Servo's GL framebuffer
-  (via `glReadPixels` on the `WindowRenderingContext`'s glow context), upload
-  as a wgpu texture, draw the URL bar on top, and present only via wgpu.
-- Clipboard is stubbed (NullClipboard) — need real clipboard integration
+- **Visual Iced widget rendering on top of Servo**: The core architectural
+  challenge. Servo owns the GL context; Iced/wgpu wants its own Vulkan surface.
+  They cannot both present to the same window. **Path forward**: read pixels
+  from Servo's GL framebuffer (via `glReadPixels` on the `WindowRenderingContext`'s
+  glow context), upload as a wgpu texture, draw Iced UI on top, present only
+  via wgpu.
+- Clipboard is not implemented — no copy/paste support
 - No mouse forwarding to Servo yet — keyboard events work but mouse clicks don't
   reach the WebView (need to forward winit mouse events to `webview.notify_input_event()`)
 
