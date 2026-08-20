@@ -35,7 +35,10 @@ use std::sync::Arc;
 // ---------------------------------------------------------------------------
 
 #[derive(Debug)]
-struct ServoWakeEvent;
+enum ServoWakeEvent {
+    Wake,
+    NewFrame,
+}
 
 // ---------------------------------------------------------------------------
 // Servo event loop waker
@@ -49,7 +52,7 @@ impl servo::EventLoopWaker for ServoWaker {
         Box::new(self.clone())
     }
     fn wake(&self) {
-        let _ = self.0.send_event(ServoWakeEvent);
+        let _ = self.0.send_event(ServoWakeEvent::Wake);
     }
 }
 
@@ -57,11 +60,13 @@ impl servo::EventLoopWaker for ServoWaker {
 // WebView delegate
 // ---------------------------------------------------------------------------
 
-struct WebViewDelegate;
+struct WebViewDelegate {
+    proxy: winit::event_loop::EventLoopProxy<ServoWakeEvent>,
+}
 
 impl servo::WebViewDelegate for WebViewDelegate {
     fn notify_new_frame_ready(&self, _webview: WebView) {
-        // Redraw is handled by our winit event loop
+        let _ = self.proxy.send_event(ServoWakeEvent::NewFrame);
     }
 }
 
@@ -75,6 +80,7 @@ enum Runner {
     },
     Ready {
         window: Arc<Window>,
+        dummy_window: Arc<Window>,
         servo: Servo,
         webview: WebView,
         rendering_context: Rc<WindowRenderingContext>,
@@ -98,16 +104,19 @@ impl winit::application::ApplicationHandler<ServoWakeEvent> for Runner {
                 .create_window(winit::window::WindowAttributes::default())
                 .expect("Create window"),
         );
-        let physical_size = window.inner_size();
 
-        // Servo rendering context
-        let display_handle = event_loop
-            .display_handle()
-            .expect("Failed to get display handle");
-        let window_handle = window.window_handle().expect("Failed to get window handle");
+        // Create a dummy invisible window for Servo to own the EGL context
+        // This avoids Wayland surface conflicts with WGPU on the main window.
+        let dummy_window = event_loop
+            .create_window(winit::window::WindowAttributes::default().with_visible(false))
+            .expect("Create dummy window");
+        let dummy_window = Arc::new(dummy_window);
+
+        let display_handle = dummy_window.display_handle().unwrap();
+        let window_handle = dummy_window.window_handle().unwrap();
 
         let rendering_context = Rc::new(
-            WindowRenderingContext::new(display_handle, window_handle, physical_size)
+            WindowRenderingContext::new(display_handle, window_handle, window.inner_size())
                 .expect("Could not create WindowRenderingContext"),
         );
         let _ = rendering_context.make_current();
@@ -125,10 +134,11 @@ impl winit::application::ApplicationHandler<ServoWakeEvent> for Runner {
         // Initial page
         let initial_url = "https://servo.org";
         let url = Url::parse(initial_url).expect("valid URL");
-        let webview = WebViewBuilder::new(&servo, rendering_context.clone())
+        let mut webview = WebViewBuilder::new(&servo, rendering_context.clone())
             .url(url)
-            .hidpi_scale_factor(euclid::Scale::new(window.scale_factor() as f32))            .delegate(Rc::new(WebViewDelegate))
-                .build();
+            .hidpi_scale_factor(euclid::Scale::new(window.scale_factor() as f32))
+            .delegate(Rc::new(WebViewDelegate { proxy: event_loop_proxy.clone() }))
+            .build();
 
         event_loop.set_control_flow(ControlFlow::Wait);
         window.set_title(&format!("kestrel-rs — {initial_url}"));
@@ -138,6 +148,7 @@ impl winit::application::ApplicationHandler<ServoWakeEvent> for Runner {
 
         *self = Self::Ready {
             window,
+            dummy_window,
             servo,
             webview,
             rendering_context,
@@ -149,10 +160,17 @@ impl winit::application::ApplicationHandler<ServoWakeEvent> for Runner {
     fn user_event(
         &mut self,
         _event_loop: &winit::event_loop::ActiveEventLoop,
-        _event: ServoWakeEvent,
+        event: ServoWakeEvent,
     ) {
-        if let Self::Ready { servo, .. } = self {
-            servo.spin_event_loop();
+        if let Self::Ready { servo, window, .. } = self {
+            match event {
+                ServoWakeEvent::Wake => {
+                    servo.spin_event_loop();
+                }
+                ServoWakeEvent::NewFrame => {
+                    window.request_redraw();
+                }
+            }
         }
     }
 
@@ -164,6 +182,7 @@ impl winit::application::ApplicationHandler<ServoWakeEvent> for Runner {
     ) {
         let Self::Ready {
             window,
+            dummy_window,
             servo,
             webview,
             rendering_context,
@@ -222,6 +241,7 @@ impl winit::application::ApplicationHandler<ServoWakeEvent> for Runner {
             }
 
             WindowEvent::Resized(new_size) => {
+                let _ = dummy_window.request_inner_size(*new_size);
                 webview.resize(*new_size);
                 rendering_context.resize(*new_size);
                 iced_integration.resize(new_size.width, new_size.height);
