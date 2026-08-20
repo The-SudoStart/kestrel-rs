@@ -183,7 +183,7 @@ impl winit::application::ApplicationHandler<ServoWakeEvent> for Runner {
                 .event_loop_waker(Box::new(ServoWaker(event_loop_proxy.clone())))
                 .preferences(prefs)
                 .build();
-        servo.setup_logging();            let url = Url::parse("https://example.com").expect("valid URL");
+        servo.setup_logging();            let url = Url::parse("https://servo.org").expect("valid URL");
         let webview = WebViewBuilder::new(&servo, rendering_context.clone())
             .url(url)                .hidpi_scale_factor(euclid::Scale::new(window.scale_factor() as f32))
                 .delegate(Rc::new(WebViewDelegate))
@@ -278,7 +278,7 @@ impl winit::application::ApplicationHandler<ServoWakeEvent> for Runner {
             modifiers: ModifiersState::default(),
             cache: user_interface::Cache::new(),
             events: Vec::new(),
-            resized: false,                url_value: "https://example.com".to_string(),
+            resized: false,                url_value: "https://servo.org".to_string(),
             servo,
             webview,
             rendering_context,
