@@ -160,11 +160,11 @@ Potential Phase 1 issues:
    both try to set the global logger. Only one can be called. We let Servo handle
    logging and use `eprintln!` for our own output.
 
-2. **TLS certificate verification fails**: `rustls_platform_verifier` can't verify
-   HTTPS certificates in some environments (error: `CaUsedAsEndEntity`). The WebView
-   is created and runs, but can't fetch HTTPS pages. This is an environment issue,
-   not a code bug. For development, we could use `env_logger` with
-   `RUST_LOG=servo=debug` for more details.
+2. **TLS certificate verification fails** (FIXED): `rustls_platform_verifier` can't
+   verify HTTPS certificates on some systems (error: `CaUsedAsEndEntity`). **Fix:**
+   Set `Preferences { network_use_webpki_roots: true, ..Default::default() }` on
+   `ServoBuilder` to use bundled WebPKI root certificates instead of the platform
+   verifier. See [Servo config prefs](servo-config/prefs.rs).
 
 3. **SQLite storage warnings**: `ClientStorage` can't open its database in `/tmp`.
    Non-fatal — logged as warnings but doesn't affect functionality.
