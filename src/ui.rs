@@ -76,6 +76,14 @@ impl IcedIntegration {
             iced_runtime::user_interface::Cache::new(),
             &mut self.renderer,
         );
+
+        // Draw UI to the renderer
+        ui.draw(
+            &mut self.renderer,
+            &iced_widget::Theme::Dark,
+            &iced_winit::core::renderer::Style { text_color: iced_winit::core::Color::WHITE },
+            iced_winit::core::mouse::Cursor::Unavailable,
+        );
         
         // We can capture the new cache state if needed:
         // self.state.cache = ui.into_cache();
@@ -83,7 +91,11 @@ impl IcedIntegration {
         // Cache in 0.14 is usually handled differently, let's just use a default or empty cache if `clone()` fails.
         // Actually, Cache::new() is cheap. Let's just create a new one to avoid lifetime/borrow issues, this is a prototype!
         
-        if let Ok(frame) = self.surface.get_current_texture() {
+        let frame_res = self.surface.get_current_texture();
+        if let Err(e) = &frame_res {
+            eprintln!("get_current_texture error: {:?}", e);
+        }
+        if let Ok(frame) = frame_res {
             let view = frame.texture.create_view(&iced_wgpu::wgpu::TextureViewDescriptor::default());
             
             let viewport = iced_graphics::Viewport::with_physical_size(
@@ -92,7 +104,7 @@ impl IcedIntegration {
             );
             
             self.renderer.present(
-                None, // clear color
+                Some(iced_winit::core::Color::BLACK), // clear color
                 self.surface_config.format,
                 &view,
                 &viewport,
