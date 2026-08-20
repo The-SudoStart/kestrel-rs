@@ -7,8 +7,16 @@ license = "MIT"
 repository = "https://github.com/The-SudoStart/kestrel-rs"
 
 [dependencies]
-# GUI framework — see ARCHITECTURE.md for why Iced was chosen
-iced = "0.14"
+# GUI framework — see ARCHITECTURE.md for why Iced was chosen.
+# We use the low-level Iced crates (not the high-level `iced` facade)
+# because we need to integrate Iced's rendering into our own winit
+# ApplicationHandler alongside Servo. See the `integration` example:
+# https://github.com/iced-rs/iced/tree/master/examples/integration
+iced_winit = "0.14"
+iced_wgpu = "0.14"
+iced_runtime = "0.14"
+iced_widget = "0.14"
+futures = "0.3"
 
 # Servo embedding — verified against crates.io (v0.5.0, released 2026-08-17).
 # See docs/servo-embedding-notes.md for API surface notes.

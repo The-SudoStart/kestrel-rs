@@ -169,6 +169,59 @@ Potential Phase 1 issues:
 3. **SQLite storage warnings**: `ClientStorage` can't open its database in `/tmp`.
    Non-fatal — logged as warnings but doesn't affect functionality.
 
+## Iced <-> Servo integration pattern (Issue #1 findings)
+
+### Architecture that works
+
+The integration uses the **low-level Iced crate path** (not `iced::application()`):
+
+1. **winit** owns the window and event loop (our custom `ApplicationHandler`)
+2. **Servo** renders web content via `WindowRenderingContext` (OpenGL/WebRender)
+3. **wgpu** creates a rendering surface on the same window (Vulkan backend)
+4. **Iced's `UserInterface`** renders the URL bar via wgpu on top
+
+This is based on Iced's `integration` example but adapted for Servo coexistence.
+
+### Key API signatures (iced 0.14, wgpu 27)
+
+- `UserInterface::build(element, size, cache, renderer)` — builds UI
+- `UserInterface::update(&mut self, events, cursor, renderer, clipboard, messages)` — processes events
+- `Viewport::with_physical_size(size, scale_factor: f32)` — NOT a Scale struct, just f32
+- `Renderer::new(engine, default_font, default_text_size)` — takes Font and Pixels, not Settings
+- `wgpu::Surface::get_current_texture()` returns `Result<SurfaceTexture, SurfaceError>`
+- `iced_winit::conversion::window_event()` converts winit events to Iced events
+- `iced_winit::core::Clipboard` trait must be implemented (NullClipboard for now)
+
+### Servo <-> Iced communication pattern
+
+Navigation dispatch flow:
+1. User types in Iced text_input, presses Enter
+2. Iced `UserInterface::update()` produces `Message::UrlBarSubmitted`
+3. In our message handler: `webview.load(url)` — calls Servo's navigation API
+4. `servo.spin_event_loop()` — processes the navigation request
+5. Servo fetches the page via its networking stack
+6. `notify_new_frame_ready` callback triggers redraw
+7. `webview.paint()` + `rendering_context.present()` renders new content
+
+### What we learned
+
+1. **Servo's GL context and wgpu can coexist on the same Wayland window.**
+   Servo uses OpenGL (WebRender), wgpu uses Vulkan. The Wayland compositor handles both.
+2. **Servo must render FIRST, then Iced draws on top.**
+   Order: `webview.paint()` → `rendering_context.present()` → wgpu render pass → Iced draw → present.
+3. **The URL bar text_input works** — typing, backspace, and Enter all function correctly
+   through Iced's `UserInterface` event processing.
+4. **Navigation dispatch works** — calling `webview.load(url)` from the Iced message
+   handler successfully triggers Servo navigation.
+
+### Remaining gaps
+
+- Clipboard is stubbed (NullClipboard) — need real clipboard integration
+- No mouse forwarding to Servo yet — keyboard events work but mouse clicks don't
+  reach the WebView (need to forward winit mouse events to `webview.notify_input_event()`)
+- TLS certificate verification fails in this environment (not a code issue)
+- The URL bar renders but needs styling (transparent background, positioned at top)
+
 ## System dependencies discovered
 
 - `libclang-dev` — required by `bindgen` (Servo uses FFI bindings). Install via
