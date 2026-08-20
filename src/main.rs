@@ -20,12 +20,9 @@ use std::mem;
 use std::rc::Rc;
 
 use iced_wgpu::graphics::{Shell as WgpuShell, Viewport};
-use iced_winit::core::renderer;
 use iced_wgpu::{Engine, Renderer, wgpu};
 use iced_winit::conversion;
 use iced_winit::core::mouse;
-use iced_winit::core::time::Instant;
-use iced_winit::core::window;
 use iced_winit::core::{Element, Event, Size, Theme};
 use iced_winit::runtime::user_interface::{self, UserInterface};
 use iced_winit::winit;
@@ -266,9 +263,13 @@ impl winit::application::ApplicationHandler<ServoWakeEvent> for Runner {
                 Renderer::new(engine, iced_winit::core::Font::default(), iced_winit::core::Pixels(16.0))
         };
 
-        event_loop.set_control_flow(ControlFlow::Wait);            *self = Self::Ready {
+        event_loop.set_control_flow(ControlFlow::Wait);
+        window.set_title("kestrel-rs — https://servo.org");
+
+        *self = Self::Ready {
             window,
             device,
+            #[allow(unused_variables)]
             queue,
             surface: Box::new(surface),
                 format,
@@ -304,7 +305,8 @@ impl winit::application::ApplicationHandler<ServoWakeEvent> for Runner {
         let Self::Ready {
             window,
             device,
-            queue,                surface,
+            queue: _queue,
+            surface,
                 format,
                 renderer,
                 viewport,
@@ -349,118 +351,18 @@ impl winit::application::ApplicationHandler<ServoWakeEvent> for Runner {
                     );
                     rendering_context.resize(size);
                     *resized = false;
-                }
-
-                // ---- Paint Servo content ----
+                }                // ---- Paint Servo content (GL only, no wgpu present) ----
+                //
+                // We ONLY present via Servo's GL context. The wgpu surface is
+                // not presented because GL and Vulkan present to the same
+                // window surface — presenting both causes flickering/blanking.
+                //
+                // The URL bar is still functional through event processing
+                // (typing + Enter navigation), but not visually rendered on
+                // screen. See docs/servo-embedding-notes.md for the pixel
+                // readback approach needed to solve this.
                 webview.paint();
                 rendering_context.present();
-
-                // ---- Draw Iced UI (URL bar) on top via wgpu ----
-                match surface.get_current_texture() {
-                    Ok(frame) => {
-                        let view = frame
-                            .texture
-                            .create_view(&wgpu::TextureViewDescriptor::default());
-                        let mut encoder =
-                            device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                                label: None,
-                            });
-
-                        // Clear to transparent
-                        {
-                            let _render_pass = encoder.begin_render_pass(
-                                &wgpu::RenderPassDescriptor {
-                                    label: Some("Iced overlay"),
-                                    color_attachments: &[Some(
-                                        wgpu::RenderPassColorAttachment {
-                                            view: &view,
-                                            resolve_target: None,
-                                            ops: wgpu::Operations {
-                                                load: wgpu::LoadOp::Clear(wgpu::Color {
-                                                    r: 0.0,
-                                                    g: 0.0,
-                                                    b: 0.0,
-                                                    a: 0.0,
-                                                }),
-                                                store: wgpu::StoreOp::Store,
-                                            },
-                                            depth_slice: None,
-                                        },
-                                    )],
-                                    depth_stencil_attachment: None,
-                                    timestamp_writes: None,
-                                    occlusion_query_set: None,
-                                },
-                            );
-                        }
-
-                        queue.submit([encoder.finish()]);
-
-                        // ---- Draw Iced UI (URL bar) ----
-                        let mut interface = UserInterface::build(
-                            url_bar(url_value),
-                            viewport.logical_size(),
-                            mem::take(cache),
-                            renderer,
-                        );
-
-                        let (state, _) = interface.update(
-                            &[Event::Window(window::Event::RedrawRequested(
-                                Instant::now(),
-                            ))],
-                            *cursor,
-                            renderer,
-                            &mut NullClipboard,
-                            &mut Vec::new(),
-                        );
-
-                        if let user_interface::State::Updated {
-                            mouse_interaction,
-                            ..
-                        } = state
-                        {
-                            if let Some(icon) =
-                                conversion::mouse_interaction(mouse_interaction)
-                            {
-                                window.set_cursor(icon);
-                                window.set_cursor_visible(true);
-                            } else {
-                                window.set_cursor_visible(false);
-                            }
-                        }
-
-                        interface.draw(
-                            renderer,
-                            &Theme::Dark,
-                            &renderer::Style::default(),
-                            *cursor,
-                        );
-
-                        *cache = interface.into_cache();
-                        renderer.present(None, frame.texture.format(), &view, viewport);
-                        frame.present();
-                    }
-                    Err(wgpu::SurfaceError::Lost) => {
-                        let size = window.inner_size();
-                        surface.configure(
-                            device,
-                            &wgpu::SurfaceConfiguration {
-                                format: *format,
-                                usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
-                                width: size.width,
-                                height: size.height,
-                                present_mode: wgpu::PresentMode::AutoVsync,
-                                alpha_mode: wgpu::CompositeAlphaMode::Auto,
-                                view_formats: vec![],
-                                desired_maximum_frame_latency: 2,
-                            },
-                        );
-                        window.request_redraw();
-                    }
-                    Err(e) => {
-                        eprintln!("Surface error: {e:?}");
-                    }
-                }
             }
 
             WindowEvent::CursorMoved { position, .. } => {
@@ -517,7 +419,10 @@ impl winit::application::ApplicationHandler<ServoWakeEvent> for Runner {
             for message in messages {
                 match message {
                     Message::UrlBarChanged(new_url) => {
-                        *url_value = new_url;
+                        *url_value = new_url.clone();
+                        // Show URL in title bar since we can't render the
+                        // URL bar visually on top of Servo's GL context yet.
+                        window.set_title(&format!("kestrel-rs — {new_url}"));
                     }
                     Message::UrlBarSubmitted => {
                         if let Ok(url) = Url::parse(url_value) {

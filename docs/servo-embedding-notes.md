@@ -216,11 +216,15 @@ Navigation dispatch flow:
 
 ### Remaining gaps
 
+- **Visual URL bar rendering**: Servo's GL `present()` and wgpu's `frame.present()`
+  both write to the same window surface, causing flickering. We now only present
+  via Servo's GL. The URL bar is functional through event processing but not
+  visually rendered. **Path forward**: read pixels from Servo's GL framebuffer
+  (via `glReadPixels` on the `WindowRenderingContext`'s glow context), upload
+  as a wgpu texture, draw the URL bar on top, and present only via wgpu.
 - Clipboard is stubbed (NullClipboard) — need real clipboard integration
 - No mouse forwarding to Servo yet — keyboard events work but mouse clicks don't
   reach the WebView (need to forward winit mouse events to `webview.notify_input_event()`)
-- TLS certificate verification fails in this environment (not a code issue)
-- The URL bar renders but needs styling (transparent background, positioned at top)
 
 ## System dependencies discovered
 
